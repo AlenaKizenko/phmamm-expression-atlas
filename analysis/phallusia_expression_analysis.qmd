@@ -1,0 +1,568 @@
+---
+title: "Phallusia mammillata: developmental expression analysis"
+subtitle: "From STAR + Salmon gene counts to stage-specific genes, expression-pattern clusters and GO enrichment"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    code-fold: true
+    embed-resources: true
+    df-print: paged
+execute:
+  warning: false
+  message: false
+---
+
+## What this notebook does
+
+Input: the merged gene-level Salmon tables (STAR alignment + Salmon quantification; `03d_merge_quant.sbatch` of the pipeline, or nf-core/rnaseq) for PRJEB25149, 15 stages x 2 replicates, and the app database
+(gene symbols and eggNOG GO terms). Output: tables in `analysis_output/` plus the figures below.
+
+1. **QC**: library sizes, genes detected, PCA, replicate agreement.
+2. **Temporal genes**: DESeq2 likelihood-ratio test of "expression depends on stage" (full model `~ replicate + stage` against `~ replicate`), plus an effect-size filter.
+3. **Expression-pattern clusters**: k-means on the stage-mean profiles of the temporal genes.
+4. **Stage specificity**: tau index and the genes that mark each stage.
+5. **GO enrichment** of every cluster (hypergeometric test, GO terms from eggNOG-mapper, propagated to parent terms).
+
+With **two replicates per stage** a pairwise comparison of two stages has little power. The likelihood-ratio test pools all
+15 stages to estimate the variance, which is why it is used here. Read adjusted p-values as a ranking, and always look at the
+profile of a gene before trusting it.
+
+**The two replicates are two separate time courses.** Every rep1 library is most similar to the rep1 library of the
+neighbouring stage, and the same for rep2 (checked on the real data): each replicate series was collected from its own
+batch of embryos. The model therefore includes `replicate` as a batch term, so this series-to-series difference is not
+mistaken for noise (more power) or for a stage effect. For the PCA and the sample correlations, the batch effect is also
+removed from the VST values (the design is balanced: every stage has one library of each series).
+
+## Settings
+
+Paths can be changed here or with environment variables (`PHM_RESULTS`, `PHM_METADATA`, `PHM_DB`, `PHM_OUT`).
+
+```{r}
+#| label: settings
+cfg <- list(
+  # folder with the merged tables (results/star_salmon)
+  results_dir = Sys.getenv("PHM_RESULTS",
+    "/nfs/scistore16/heisegrp/akizenko/Phallusia_mammillata/phallusia_rnaseq/results/star_salmon"),
+  # the 30 libraries: sample, stage, hotta_stage, replicate, dev_order
+  metadata    = Sys.getenv("PHM_METADATA", "../sample_metadata.csv"),
+  # the SQLite file of the app (gene symbols, descriptions, eggNOG GO terms)
+  app_db      = Sys.getenv("PHM_DB", "../app/data/phallusia.sqlite"),
+  out_dir     = Sys.getenv("PHM_OUT", "analysis_output"),
+
+  min_count      = 10,    # a gene is tested if it has >= min_count reads ...
+  min_samples    = 2,     # ... in at least this many samples (= one stage with 2 replicates)
+  fdr            = 0.01,  # LRT adjusted p-value for "temporal gene"
+  min_log2_range = 1,     # ... and stage-mean VST (about log2) must differ >= 2-fold between the highest and lowest stage
+  k              = 10,    # number of clusters (deliberately a bit high; see section 3). NA = pick the best silhouette in 4-12
+  tau_min_tpm    = 1,     # tau is only reported for genes with a stage-mean TPM >= this
+  marker_tau     = 0.8,   # stage markers: tau >= this ...
+  marker_tpm     = 5,     # ... and peak stage-mean TPM >= this
+  go_min_size    = 5,     # GO terms with fewer / more genes in the tested set are skipped
+  go_max_size    = 1000,
+  seed           = 1
+)
+set.seed(cfg$seed)
+dir.create(cfg$out_dir, showWarnings = FALSE, recursive = TRUE)
+
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(SummarizedExperiment)
+  library(ggplot2)
+  library(pheatmap)
+})
+theme_set(theme_bw(base_size = 11))
+```
+
+## Load the data
+
+Three inputs are understood, in this order of preference. All of them give the same counts; the first two also carry the
+average transcript length of every gene in every sample, which DESeq2 uses as an offset (tximport recommendation; it matters
+when isoform usage changes between stages).
+
+1. `salmon.merged.gene.SummarizedExperiment.rds` (written by nf-core/rnaseq),
+2. `salmon.merged.gene_counts.tsv` + `salmon.merged.gene_tpm.tsv` + `salmon.merged.gene_lengths.tsv` (written by `03d_merge_quant.sbatch`),
+3. the count and TPM tables alone (counts rounded, no length offsets).
+
+```{r}
+#| label: load
+se_file  <- file.path(cfg$results_dir, "salmon.merged.gene.SummarizedExperiment.rds")
+cnt_file <- file.path(cfg$results_dir, "salmon.merged.gene_counts.tsv")
+tpm_file <- file.path(cfg$results_dir, "salmon.merged.gene_tpm.tsv")
+len_file <- file.path(cfg$results_dir, "salmon.merged.gene_lengths.tsv")
+
+meta <- read.csv(cfg$metadata, stringsAsFactors = FALSE)
+meta$stage_label <- ifelse(meta$hotta_stage == "" | is.na(meta$hotta_stage), meta$stage,
+                           paste0(meta$stage, " (", meta$hotta_stage, ")"))
+meta <- meta[order(meta$dev_order, meta$replicate), ]
+stage_levels <- unique(meta$stage_label)
+meta$stage_f <- factor(meta$stage_label, levels = stage_levels)
+
+read_matrix <- function(f) {                       # tables: gene_id, [gene_name], one column per sample
+  x <- read.delim(f, check.names = FALSE, stringsAsFactors = FALSE)
+  m <- as.matrix(x[, !(names(x) %in% c("gene_id", "gene_name")), drop = FALSE])
+  rownames(m) <- x$gene_id
+  m
+}
+
+if (file.exists(se_file)) {
+  se <- readRDS(se_file)
+  counts_all <- assay(se, "counts")
+  tpm_all    <- assay(se, "tpm")
+  len_all    <- assay(se, "length")
+  input_type <- "SummarizedExperiment with transcript-length offsets"
+} else {
+  stopifnot(file.exists(cnt_file), file.exists(tpm_file))
+  counts_all <- read_matrix(cnt_file)
+  tpm_all    <- read_matrix(tpm_file)
+  if (file.exists(len_file)) {
+    len_all    <- read_matrix(len_file)[rownames(counts_all), colnames(counts_all), drop = FALSE]
+    input_type <- "count, TPM and gene-length tables (with transcript-length offsets)"
+  } else {
+    len_all    <- NULL
+    input_type <- "count table, rounded (no length offsets)"
+  }
+}
+
+missing_samples <- setdiff(meta$sample, colnames(counts_all))
+if (length(missing_samples) > 0)
+  stop("Samples in the metadata but not in the count table: ", paste(missing_samples, collapse = ", "))
+counts_all <- counts_all[, meta$sample, drop = FALSE]
+tpm_all    <- tpm_all[rownames(counts_all), meta$sample, drop = FALSE]
+if (!is.null(len_all)) len_all <- len_all[rownames(counts_all), meta$sample, drop = FALSE]
+
+# Mitochondrial genes (MT-...) are transcribed in the mitochondria, not the nucleus, and take 15-30% of Salmon's TPM
+# (changing with stage). Put them on their own TPM scale, as the app database does: per sample the nuclear genes
+# sum to 10^6 and the MT genes without the 2 rRNAs (MT-RNR1/2; 16S would be ~99%) sum to 10^6; the rRNAs use the same
+# factor. Counts (DESeq2) are not changed.
+is_mt <- startsWith(rownames(tpm_all), "MT-")
+if (any(is_mt) && !all(is_mt)) {
+  mt_share <- colSums(tpm_all[is_mt, , drop = FALSE]) / colSums(tpm_all)
+  cat(sprintf("Mitochondrial genes: %d, %.1f-%.1f%% of Salmon's TPM; nuclear and MT TPM rescaled separately.\n",
+              sum(is_mt), 100 * min(mt_share), 100 * max(mt_share)))
+  tpm_all[!is_mt, ] <- sweep(tpm_all[!is_mt, , drop = FALSE], 2, colSums(tpm_all[!is_mt, , drop = FALSE]), "/") * 1e6
+  mt_mrna <- is_mt & !grepl("^MT-RNR", rownames(tpm_all))
+  tpm_all[is_mt, ]  <- sweep(tpm_all[is_mt, , drop = FALSE], 2, colSums(tpm_all[mt_mrna, , drop = FALSE]), "/") * 1e6
+}
+
+coldata <- data.frame(row.names = meta$sample, stage = meta$stage_f, replicate = factor(meta$replicate))
+
+# gene annotation from the app database (optional)
+have_db <- file.exists(cfg$app_db) && requireNamespace("RSQLite", quietly = TRUE)
+if (have_db) {
+  con <- DBI::dbConnect(RSQLite::SQLite(), cfg$app_db, flags = RSQLite::SQLITE_RO)
+  gene_info <- DBI::dbGetQuery(con, "SELECT gene_id, symbol, description, biotype FROM genes")
+  eggnog    <- DBI::dbGetQuery(con, "SELECT gene_id, gos FROM eggnog WHERE gos IS NOT NULL AND gos NOT IN ('', '-')")
+  DBI::dbDisconnect(con)
+} else {
+  message("App database not found (", cfg$app_db, "): gene names and GO enrichment are skipped.")
+  gene_info <- data.frame(gene_id = rownames(counts_all), symbol = NA_character_,
+                          description = NA_character_, biotype = NA_character_)
+  eggnog <- data.frame(gene_id = character(), gos = character())
+}
+
+cat("Input:", input_type, "\n",
+    nrow(counts_all), "genes x", ncol(counts_all), "samples,", nlevels(meta$stage_f), "stages\n")
+```
+
+## 1. Quality control
+
+```{r}
+#| label: qc-basic
+#| fig-width: 9
+#| fig-height: 6
+qc <- data.frame(
+  sample          = meta$sample,
+  stage           = meta$stage_f,
+  replicate       = meta$replicate,
+  counts_millions = round(colSums(counts_all) / 1e6, 2),
+  genes_tpm_ge_1  = colSums(tpm_all >= 1)
+)
+write.csv(qc, file.path(cfg$out_dir, "qc_samples.csv"), row.names = FALSE)
+
+p1 <- ggplot(qc, aes(sample, counts_millions, fill = stage)) +
+  geom_col(show.legend = FALSE) + labs(x = NULL, y = "assigned reads (millions)") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 7))
+p2 <- ggplot(qc, aes(sample, genes_tpm_ge_1, fill = stage)) +
+  geom_col(show.legend = FALSE) + labs(x = NULL, y = "genes with TPM >= 1") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 7))
+if (requireNamespace("patchwork", quietly = TRUE)) {
+  patchwork::wrap_plots(p1, p2, ncol = 1)
+} else {
+  print(p1); print(p2)
+}
+```
+
+## 2. DESeq2: which genes change over development
+
+```{r}
+#| label: deseq
+if (!is.null(len_all)) {
+  txi <- list(counts = counts_all, abundance = tpm_all, length = pmax(len_all, 1),
+              countsFromAbundance = "no")
+  dds <- DESeqDataSetFromTximport(txi, colData = coldata, design = ~ replicate + stage)
+} else {
+  dds <- DESeqDataSetFromMatrix(round(counts_all), colData = coldata, design = ~ replicate + stage)
+}
+keep <- rowSums(counts(dds) >= cfg$min_count) >= cfg$min_samples
+dds  <- dds[keep, ]
+# replicate = the time course (batch of embryos) a library comes from; see the note at the top
+dds  <- DESeq(dds, test = "LRT", reduced = ~ replicate, quiet = TRUE)
+lrt  <- as.data.frame(results(dds))
+lrt$gene_id <- rownames(lrt)
+
+vsd <- vst(dds, blind = FALSE)
+vmat <- assay(vsd)
+# VST with the replicate-series (batch) effect removed, for PCA and sample correlations. Same result as
+# limma::removeBatchEffect(vmat, batch = replicate, design = model.matrix(~ stage)) for this balanced design:
+# per gene, the stage-adjusted mean of each series is moved to the overall mean.
+vmat_bc <- vmat
+stage_mean_all <- sapply(split(seq_len(ncol(vmat)), meta$stage_f), function(i) rowMeans(vmat[, i, drop = FALSE]))
+resid <- vmat - stage_mean_all[, as.integer(meta$stage_f)]
+for (r in levels(coldata$replicate)) {
+  i <- which(coldata$replicate == r)
+  vmat_bc[, i] <- vmat[, i] - rowMeans(resid[, i, drop = FALSE])
+}
+cat("Replicate-series effect: median |rep1 - rep2| shift per gene =",
+    round(median(abs(rowMeans(resid[, coldata$replicate == levels(coldata$replicate)[1], drop = FALSE]) -
+                     rowMeans(resid[, coldata$replicate == levels(coldata$replicate)[2], drop = FALSE]))), 3), "(VST units, ~log2)\n")
+cat(sum(keep), "of", length(keep), "genes pass the expression filter (>=", cfg$min_count,
+    "reads in >=", cfg$min_samples, "samples).\n")
+```
+
+### PCA and replicate agreement
+
+```{r}
+#| label: pca
+#| fig-width: 8
+#| fig-height: 6
+top <- order(apply(vmat_bc, 1, var), decreasing = TRUE)[seq_len(min(2000, nrow(vmat_bc)))]
+pc  <- prcomp(t(vmat_bc[top, ]), center = TRUE)
+ve  <- round(100 * pc$sdev^2 / sum(pc$sdev^2), 1)
+pcdf <- data.frame(pc$x[, 1:2], stage = meta$stage_f, replicate = factor(meta$replicate), sample = meta$sample)
+cent <- aggregate(cbind(PC1, PC2) ~ stage, pcdf, mean)
+
+ggplot(pcdf, aes(PC1, PC2)) +
+  geom_path(data = cent, colour = "grey60", linewidth = 0.4,
+            arrow = arrow(length = unit(0.12, "cm"))) +
+  geom_point(aes(colour = stage, shape = replicate), size = 3) +
+  scale_colour_viridis_d(option = "turbo") +
+  labs(x = paste0("PC1 (", ve[1], "%)"), y = paste0("PC2 (", ve[2], "%)"),
+       title = "Top 2000 variable genes (VST, replicate-series effect removed); grey line = stage centroids in developmental order")
+```
+
+For each sample the most correlated other sample (top 2000 variable genes, replicate-series effect removed) should be its replicate or a neighbouring stage.
+Without the correction, the nearest sample is usually the same series at the neighbouring stage (the batch effect):
+
+```{r}
+#| label: nearest
+cm_raw <- cor(vmat[top, ]); diag(cm_raw) <- NA
+same_series <- coldata$replicate[apply(cm_raw, 1, which.max)] == coldata$replicate
+cat("Without batch correction:", sum(same_series), "of", length(same_series),
+    "samples have a library of the same replicate series as nearest sample.\n")
+cm <- cor(vmat_bc[top, ]); diag(cm) <- NA
+nearest <- apply(cm, 1, function(r) names(which.max(r)))
+nn <- data.frame(sample = meta$sample, stage = as.character(meta$stage_f),
+                 nearest = unname(nearest[meta$sample]), stringsAsFactors = FALSE)
+nn$nearest_stage <- as.character(meta$stage_f[match(nn$nearest, meta$sample)])
+nn$same_stage    <- nn$stage == nn$nearest_stage
+nn$stage_distance <- abs(as.integer(meta$stage_f[match(nn$nearest, meta$sample)]) - as.integer(meta$stage_f))
+cat(sum(nn$same_stage), "of", nrow(nn), "samples have their replicate as nearest sample;",
+    sum(nn$stage_distance <= 1), "of", nrow(nn), "have it within one stage.\n")
+nn[nn$stage_distance > 1, ]   # anything listed here deserves a look (swapped or failed library?)
+```
+
+```{r}
+#| label: corr-heatmap
+#| fig-width: 8
+#| fig-height: 7.5
+ann <- data.frame(stage = meta$stage_f, row.names = meta$sample)
+cm2 <- cor(vmat_bc[top, ])
+pheatmap(cm2, annotation_col = ann, annotation_row = ann, show_rownames = FALSE, show_colnames = FALSE,
+         cluster_rows = FALSE, cluster_cols = FALSE, main = "Sample correlation (developmental order, replicate-series effect removed)",
+         color = colorRampPalette(c("white", "firebrick"))(50))
+```
+
+### Temporal genes
+
+A gene is called **temporal** when the LRT adjusted p-value is below `fdr` **and** its stage-mean VST differs by at least
+`min_log2_range` between the highest and the lowest stage.
+(The log fold change that DESeq2 prints for an LRT compares only two arbitrary stages, so it is not used.)
+
+```{r}
+#| label: temporal
+stage_idx <- split(seq_len(ncol(vmat)), meta$stage_f)
+vst_stage <- sapply(stage_idx, function(i) rowMeans(vmat[, i, drop = FALSE]))   # genes x stages
+vst_range <- apply(vst_stage, 1, function(x) max(x) - min(x))
+
+lrt$vst_range <- vst_range[lrt$gene_id]
+lrt$temporal  <- !is.na(lrt$padj) & lrt$padj < cfg$fdr & lrt$vst_range >= cfg$min_log2_range
+cat(sum(lrt$temporal), "temporal genes out of", nrow(lrt), "tested (",
+    round(100 * mean(lrt$temporal), 1), "%).\n")
+cat(sum(!is.na(lrt$padj) & lrt$padj < cfg$fdr), "genes have padj <", cfg$fdr,
+    "before the effect-size filter.\n")
+
+ggplot(lrt, aes(vst_range, -log10(pmax(padj, 1e-300)), colour = temporal)) +
+  geom_point(size = 0.6, alpha = 0.5) +
+  scale_colour_manual(values = c("grey60", "firebrick")) +
+  labs(x = "stage-mean VST range (max - min, ~log2)", y = "-log10 adjusted p (LRT)")
+```
+
+## 3. Expression-pattern clusters
+
+Each temporal gene is reduced to its stage-mean VST profile (15 values) and z-scored across stages, so clusters group the
+*shape* of the profile and not the expression level.
+
+**Choosing k.** Profiles along a developmental series change gradually, so there is no sharp "natural" number of clusters.
+The average silhouette width (plotted below for information) tends to fall steadily as k grows, which favours a few broad clusters; in
+the simulated test of this notebook it picked the smallest k offered and merged three distinct patterns into one. Merging
+two similar clusters afterwards is easy, un-merging is not, so `k` is set a little high (10) and clusters whose centroids correlate
+strongly are listed below as merge candidates. Set `cfg$k <- NA` to use the best silhouette instead.
+A cluster with only a handful of genes and a jagged centroid is usually a bag of noisy genes, not a pattern.
+
+```{r}
+#| label: cluster
+tg <- lrt$gene_id[lrt$temporal]
+Z  <- t(scale(t(vst_stage[tg, , drop = FALSE])))
+Z  <- Z[complete.cases(Z), , drop = FALSE]
+
+ks  <- 4:12
+sub <- sample(nrow(Z), min(2000, nrow(Z)))
+d   <- dist(Z[sub, ])
+sil <- sapply(ks, function(k) {
+  km <- kmeans(Z[sub, ], centers = k, nstart = 10, iter.max = 100)
+  mean(cluster::silhouette(km$cluster, d)[, 3])
+})
+k_use <- if (is.na(cfg$k)) ks[which.max(sil)] else cfg$k
+ggplot(data.frame(k = ks, silhouette = sil), aes(k, silhouette)) +
+  geom_line() + geom_point() + geom_vline(xintercept = k_use, linetype = 2) +
+  labs(title = paste("Average silhouette width (2000 genes); k used =", k_use))
+
+km <- kmeans(Z, centers = k_use, nstart = 25, iter.max = 100)
+# number the clusters by when their profile peaks (cluster 1 = earliest)
+cen <- km$centers
+w   <- apply(cen, 1, function(x) { x <- pmax(x, 0)^2; sum(seq_along(x) * x) / sum(x) })
+rank_of <- rank(w, ties.method = "first")
+cluster_of <- setNames(as.integer(rank_of[km$cluster]), rownames(Z))
+cen <- cen[order(rank_of), , drop = FALSE]; rownames(cen) <- seq_len(k_use)
+table(cluster = cluster_of)
+
+# merge candidates: centroid profiles that are almost the same shape
+cc <- cor(t(cen))
+mc <- which(upper.tri(cc) & cc > 0.9, arr.ind = TRUE)
+if (nrow(mc) > 0) data.frame(cluster_a = mc[, 1], cluster_b = mc[, 2], r = round(cc[mc], 2)) else
+  cat("No pair of cluster centroids correlates above 0.9.\n")
+```
+
+```{r}
+#| label: cluster-plot
+#| fig-width: 11
+#| fig-height: 8
+cl_n <- table(cluster_of)
+long_c <- data.frame(
+  cluster = factor(rep(seq_len(k_use), each = ncol(cen)),
+                   labels = paste0("cluster ", seq_len(k_use), " (n=", cl_n[as.character(seq_len(k_use))], ")")),
+  stage = factor(rep(colnames(cen), times = k_use), levels = colnames(cen)),
+  z = as.vector(t(cen)))
+shown <- unlist(lapply(split(names(cluster_of), cluster_of), function(g) head(sample(g), 150)))
+long_g <- data.frame(gene = rep(shown, each = ncol(Z)),
+                     cluster = factor(rep(cluster_of[shown], each = ncol(Z)), levels = seq_len(k_use),
+                                      labels = levels(long_c$cluster)),
+                     stage = factor(rep(colnames(Z), times = length(shown)), levels = colnames(Z)),
+                     z = as.vector(t(Z[shown, ])))
+ggplot() +
+  geom_line(data = long_g, aes(stage, z, group = gene), colour = "grey70", alpha = 0.3, linewidth = 0.2) +
+  geom_line(data = long_c, aes(stage, z, group = 1), colour = "firebrick", linewidth = 1) +
+  facet_wrap(~ cluster, ncol = 3) +
+  labs(x = NULL, y = "z-score of stage-mean VST") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 6))
+```
+
+```{r}
+#| label: cluster-heatmap
+#| fig-width: 8
+#| fig-height: 8
+ord <- order(cluster_of, apply(Z, 1, which.max))
+Zo  <- Z[ord, , drop = FALSE]
+cl_sorted <- cluster_of[rownames(Zo)]
+if (nrow(Zo) > 4000) {                         # keep the figure light: random 4000 genes, still grouped by cluster
+  pick <- sort(sample(nrow(Zo), 4000)); Zo <- Zo[pick, ]; cl_sorted <- cl_sorted[pick]
+}
+pheatmap(pmax(pmin(Zo, 2.5), -2.5), cluster_rows = FALSE, cluster_cols = FALSE, show_rownames = FALSE,
+         gaps_row = cumsum(table(cl_sorted)), annotation_row = data.frame(cluster = factor(cl_sorted), row.names = rownames(Zo)),
+         color = colorRampPalette(c("navy", "white", "firebrick"))(60),
+         main = "Temporal genes, z-score of stage-mean VST (clusters top to bottom)")
+```
+
+## 4. Stage specificity (tau)
+
+Tau (Yanai et al. 2005) runs from 0 (same expression in all stages) to 1 (expressed in one stage only). It is computed
+from log2(stage-mean TPM + 1) for every gene with a stage-mean TPM of at least `tau_min_tpm`.
+Because of the log scale a high tau needs a really low background: for a gene at 200 TPM in its peak stage,
+tau >= 0.8 means the other stages must stay below about 2 TPM (tau = 1 - log2(background + 1) / log2(peak + 1) when all other stages
+are equal); at 20 TPM the background must stay below about 1 TPM. Lower `marker_tau` for a broader marker list.
+
+```{r}
+#| label: tau
+tpm_stage <- sapply(stage_idx, function(i) rowMeans(tpm_all[, i, drop = FALSE]))
+x    <- log2(tpm_stage + 1)
+xmax <- apply(x, 1, max)
+tau  <- rowSums(1 - x / xmax) / (ncol(x) - 1)
+max_tpm <- apply(tpm_stage, 1, max)
+tau[max_tpm < cfg$tau_min_tpm | xmax == 0] <- NA
+peak_stage <- colnames(tpm_stage)[max.col(tpm_stage, ties.method = "first")]
+
+summary(tau)
+ggplot(data.frame(tau = tau[!is.na(tau)]), aes(tau)) + geom_histogram(bins = 50, fill = "grey40") +
+  labs(x = "tau", y = "genes", title = "Stage specificity of all genes with TPM >= 1 in some stage")
+```
+
+```{r}
+#| label: markers
+anno <- gene_info[match(rownames(tpm_stage), gene_info$gene_id), c("symbol", "description")]
+gs <- data.frame(gene_id = rownames(tpm_stage), symbol = anno$symbol, description = anno$description,
+                 peak_stage = peak_stage, max_stage_tpm = round(max_tpm, 2), tau = round(tau, 3),
+                 stringsAsFactors = FALSE)
+m <- gs[!is.na(gs$tau) & gs$tau >= cfg$marker_tau & gs$max_stage_tpm >= cfg$marker_tpm, ]
+m <- m[order(factor(m$peak_stage, levels = stage_levels), -m$tau, -m$max_stage_tpm), ]
+markers <- do.call(rbind, lapply(split(m, factor(m$peak_stage, levels = stage_levels)), head, 25))
+write.csv(markers, file.path(cfg$out_dir, "stage_markers.csv"), row.names = FALSE)
+
+cat("Stage markers (tau >=", cfg$marker_tau, "and peak TPM >=", cfg$marker_tpm, "):\n")
+print(table(factor(m$peak_stage, levels = stage_levels)))
+knitr::kable(do.call(rbind, lapply(split(m, factor(m$peak_stage, levels = stage_levels)), head, 3))[,
+             c("peak_stage", "gene_id", "symbol", "description", "max_stage_tpm", "tau")],
+             row.names = FALSE, caption = "Top 3 marker genes per stage (full list: stage_markers.csv)")
+```
+
+## 5. GO enrichment of the clusters
+
+GO terms come from eggNOG-mapper (column `GOs`, electronic annotations excluded by the run settings). If the `GO.db`
+package is installed, each gene is also annotated with all parent terms (true-path rule); without it only the terms
+eggNOG reports are used, which lowers the power for general terms. **Universe** = all tested genes that have at least one
+GO term. Test = one-sided hypergeometric, Benjamini-Hochberg within each cluster, terms with at least 2 cluster genes.
+
+```{r}
+#| label: go
+have_godb <- requireNamespace("GO.db", quietly = TRUE)
+enr <- NULL
+if (nrow(eggnog) == 0) {
+  cat("No eggNOG GO terms available (app database missing or empty): enrichment skipped.\n")
+} else {
+  go_list <- strsplit(eggnog$gos, "[,;|]")
+  names(go_list) <- eggnog$gene_id
+  go_list <- lapply(go_list, function(g) unique(grep("^GO:[0-9]{7}$", trimws(g), value = TRUE)))
+  go_list <- go_list[lengths(go_list) > 0]
+
+  if (have_godb) {
+    anc <- c(as.list(GO.db::GOBPANCESTOR), as.list(GO.db::GOCCANCESTOR), as.list(GO.db::GOMFANCESTOR))
+    go_list <- lapply(go_list, function(g) setdiff(unique(c(g, unlist(anc[g], use.names = FALSE))), c("all", NA)))
+  } else {
+    message("GO.db not installed: GO terms are not propagated to parent terms and term names are not shown.")
+  }
+
+  universe <- intersect(lrt$gene_id, names(go_list))
+  tg_tab <- data.frame(gene = rep(names(go_list), lengths(go_list)), term = unlist(go_list, use.names = FALSE),
+                       stringsAsFactors = FALSE)
+  tg_tab <- tg_tab[tg_tab$gene %in% universe, ]
+  term_size <- table(tg_tab$term)
+  ok_terms  <- names(term_size)[term_size >= cfg$go_min_size & term_size <= cfg$go_max_size]
+  tg_tab    <- tg_tab[tg_tab$term %in% ok_terms, ]
+  N <- length(universe)
+
+  one_cluster <- function(cl) {
+    S <- intersect(names(cluster_of)[cluster_of == cl], universe)
+    n <- length(S)
+    if (n < 5) return(NULL)
+    kk <- table(tg_tab$term[tg_tab$gene %in% S])
+    kk <- kk[kk >= 2]
+    if (length(kk) == 0) return(NULL)
+    K <- as.integer(term_size[names(kk)])
+    k <- as.integer(kk)
+    p <- phyper(k - 1, K, N - K, n, lower.tail = FALSE)
+    data.frame(cluster = cl, go_id = names(kk), k = k, n = n, K = K, N = N,
+               fold = round((k / n) / (K / N), 2), pvalue = p, padj = p.adjust(p, "BH"),
+               stringsAsFactors = FALSE)
+  }
+  enr <- do.call(rbind, lapply(seq_len(k_use), one_cluster))
+
+  if (!is.null(enr) && nrow(enr) > 0) {
+    if (have_godb) {
+      nm <- suppressMessages(AnnotationDbi::select(GO.db::GO.db, keys = unique(enr$go_id),
+                                                   columns = c("TERM", "ONTOLOGY"), keytype = "GOID"))
+      enr$term     <- nm$TERM[match(enr$go_id, nm$GOID)]
+      enr$ontology <- nm$ONTOLOGY[match(enr$go_id, nm$GOID)]
+    } else {
+      enr$term <- enr$go_id; enr$ontology <- NA_character_
+    }
+    enr <- enr[order(enr$cluster, enr$padj), ]
+    write.csv(enr, file.path(cfg$out_dir, "cluster_go_enrichment.csv"), row.names = FALSE)
+  }
+}
+cat("Universe:", if (exists("N")) N else 0, "genes with GO terms.\n")
+```
+
+```{r}
+#| label: go-table
+if (!is.null(enr) && nrow(enr) > 0) {
+  sig <- enr[enr$padj < 0.05, ]
+  cat(nrow(sig), "enriched terms (padj < 0.05) in", length(unique(sig$cluster)), "of", k_use, "clusters.\n")
+  top5 <- do.call(rbind, lapply(split(sig, sig$cluster), head, 5))
+  knitr::kable(top5[, c("cluster", "ontology", "go_id", "term", "k", "K", "fold", "padj")],
+               row.names = FALSE, digits = 4, caption = "Top 5 enriched GO terms per cluster (all: cluster_go_enrichment.csv)")
+}
+```
+
+```{r}
+#| label: go-dotplot
+#| fig-width: 9
+#| fig-height: 7
+if (!is.null(enr) && nrow(enr[enr$padj < 0.05, ]) > 0) {
+  sig <- enr[enr$padj < 0.05, ]
+  top3 <- do.call(rbind, lapply(split(sig, sig$cluster), head, 3))
+  top3$label <- factor(paste0(top3$term, " [", top3$go_id, "]"), levels = rev(unique(paste0(top3$term, " [", top3$go_id, "]"))))
+  ggplot(top3, aes(factor(cluster), label, size = k, colour = -log10(padj))) +
+    geom_point() + scale_colour_viridis_c(option = "plasma") +
+    labs(x = "cluster (1 = earliest peak)", y = NULL, size = "genes", colour = "-log10 padj")
+}
+```
+
+## 6. Export for the app and the paper
+
+```{r}
+#| label: export
+out <- gs
+out$tested      <- out$gene_id %in% lrt$gene_id
+out$lrt_stat    <- lrt$stat[match(out$gene_id, lrt$gene_id)]
+out$lrt_padj    <- lrt$padj[match(out$gene_id, lrt$gene_id)]
+out$vst_range   <- round(lrt$vst_range[match(out$gene_id, lrt$gene_id)], 3)
+out$temporal    <- lrt$temporal[match(out$gene_id, lrt$gene_id)]
+out$cluster     <- unname(cluster_of[out$gene_id])
+write.csv(out, file.path(cfg$out_dir, "gene_summary.csv"), row.names = FALSE)
+
+write.csv(data.frame(gene_id = rownames(vst_stage), round(vst_stage, 3), check.names = FALSE),
+          file.path(cfg$out_dir, "stage_mean_vst.csv"), row.names = FALSE)
+write.csv(data.frame(cluster = seq_len(k_use), round(cen, 3), check.names = FALSE),
+          file.path(cfg$out_dir, "cluster_centroids.csv"), row.names = FALSE)
+
+data.frame(file = list.files(cfg$out_dir),
+           kb = round(file.size(list.files(cfg$out_dir, full.names = TRUE)) / 1024))
+```
+
+`gene_summary.csv` has one row per gene (LRT statistic and adjusted p-value, temporal yes/no, cluster, peak stage, tau).
+It can be added to the app as extra columns.
+
+## Methods text (for the paper)
+
+Reads of PRJEB25149 were trimmed with fastp, aligned with STAR (two-pass mode) to the RefSeq genome GCF_965637545.1 plus the
+mitochondrial genome OZ281502.1 and quantified with Salmon in alignment-based mode. (Adapt this sentence if you ran nf-core/rnaseq instead.) Gene-level estimated counts with average transcript-length
+offsets were imported into DESeq2 (tximport workflow). Genes with at least 10 reads in at least 2 samples were tested with
+the likelihood-ratio test (`~ stage` versus `~ 1`); genes with adjusted p < 0.01 and a stage-mean VST range of at least 1 were
+called temporal. Z-scored stage-mean VST profiles were clustered with k-means. Stage specificity was measured with tau (Yanai
+et al. 2005). GO enrichment used eggNOG-mapper annotations propagated to parent terms, a hypergeometric test and
+Benjamini-Hochberg correction. (Adapt the package versions below.)
+
+```{r}
+#| label: session
+sessionInfo()
+```

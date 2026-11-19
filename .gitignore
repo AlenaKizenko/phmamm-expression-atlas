@@ -1,0 +1,21 @@
+# real database (large, built from the pipeline output; publish it as a release asset / on Zenodo instead)
+app/data/phallusia.sqlite
+*.sqlite
+!app/data/demo.sqlite
+# R / Python / OS
+.Rproj.user/
+.Rhistory
+.RData
+rsconnect/
+__pycache__/
+.DS_Store
+# pipeline run outputs
+work/
+results/
+.nextflow*
+# analysis notebook outputs and test runs
+analysis/analysis_output/
+analysis/test/_work/
+analysis/figure/
+analysis/*.knit.md
+analysis/*_files/
